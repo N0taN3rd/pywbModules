@@ -1,3 +1,4 @@
+from __future__ import absolute_import
 import atexit
 import base64
 import bisect
@@ -32,16 +33,8 @@ import time
 import webencodings
 import yaml
 import zlib
-
+import multiprocessing
 from heapq import merge
-
-try:  # pragma: no cover
-    import uwsgi
-
-    uwsgi_cache = True
-except ImportError:
-    uwsgi_cache = False
-
 from argparse import ArgumentParser, RawTextHelpFormatter
 from bisect import insort
 from collections import deque
@@ -49,12 +42,10 @@ from copy import copy
 from datetime import datetime, timedelta
 from distutils.util import strtobool
 from email.utils import parsedate, formatdate
-from __future__ import absolute_import
 from io import open, BytesIO
 from itertools import chain
 from jinja2 import Environment
 from jinja2 import FileSystemLoader, PackageLoader, ChoiceLoader
-from json import loads as json_decode
 from pkg_resources import resource_string
 from pprint import pformat
 from redis import StrictRedis
@@ -67,25 +58,34 @@ from six.moves.html_parser import HTMLParser
 from six.moves.http_cookies import SimpleCookie, CookieError
 from six.moves import zip, range, map
 from six.moves.urllib.error import HTTPError
-from six.moves.urllib.parse import parse_qs
+from six.moves.urllib.parse import parse_qs,  quote
 from six.moves.urllib.parse import quote_plus, unquote_plus
-from six.moves.urllib.parse import urlencode, quote
-from six.moves.urllib.parse import urljoin, unquote_plus, urlsplit
+from six.moves.urllib.parse import urlencode
 from six.moves.urllib.parse import urljoin, urlsplit, urlunsplit
-from six.moves.urllib.parse import urlsplit, urlunsplit
 from six.moves.urllib.request import pathname2url, url2pathname
 from six.moves.urllib.request import urlopen, Request
 from tempfile import NamedTemporaryFile, mkdtemp
 from tempfile import SpooledTemporaryFile
 from watchdog.events import RegexMatchingEventHandler
 from watchdog.observers import Observer
+from json import loads as json_decode
+from json import dumps as json_encode
+# ensure we are loading the config files nicely
+from pywb import DEFAULT_CONFIG, DEFAULT_RULES_FILE, DEFAULT_CONFIG_FILE
+
 six.moves.html_parser.unescape = lambda x: x
 
+try:  # pragma: no cover
+    import uwsgi
+
+    uwsgi_cache = True
+except ImportError:
+    uwsgi_cache = False
 
 if os.environ.get('GEVENT_MONKEY_PATCH') == '1':  # pragma: no cover
     # Use gevent if available
     try:
-        from gevent.monkey import patch_all;
+        from gevent.monkey import patch_all
 
         patch_all()
         print('gevent patched!')
@@ -124,14 +124,15 @@ try:  # pragma: no cover
 except ImportError:  # pragma: no cover
     from ordereddict import OrderedDict
 
-from json import loads as json_decode
-from json import dumps as json_encode
 
-# TODO(FIX THIS!!!)
-from pywb import DEFAULT_CONFIG
+
+# =============================================================================
+EXT_REGEX = '.*\.w?arc(\.gz)?$'
+
+keep_running = True
 
 # =================================================================
-DEFAULT_RULES_FILE = 'pywb/rules.yaml'
+
 
 DEFAULT_PORT = 8080
 
@@ -140,7 +141,7 @@ WRAP_WIDTH = 80
 FILTERS = {}
 
 # =================================================================
-DEFAULT_CONFIG_FILE = 'config.yaml'
+
 
 DATE_TIMESPLIT = re.compile(r'[^\d]')
 
@@ -442,7 +443,7 @@ class BlockLoader(BaseLoader):
 
     def __init__(self, **kwargs):
         self.cached = {}
-        self.kwargs = kwargs
+        self.kwargs = kwargss
 
     def load(self, url, offset=0, length=-1):
         loader, url = self._get_loader_for_url(url)
@@ -722,6 +723,9 @@ class LimitReader(object):
 
         return stream
 
+
+
+BlockLoader.init_default_loaders()
 
 # ============================================================================
 
@@ -3171,6 +3175,816 @@ class PathResolverMapper(object):
 
 # end pywb.warc.pathresolvers
 
+# begin pywb.warc.archiveiterator
+#=================================================================
+class ArchiveIterator(object):
+    """ Iterate over records in WARC and ARC files, both gzip chunk
+    compressed and uncompressed
+
+    The indexer will automatically detect format, and decompress
+    if necessary.
+
+    """
+
+    GZIP_ERR_MSG = """
+    ERROR: Non-chunked gzip file detected, gzip block continues
+    beyond single record.
+
+    This file is probably not a multi-chunk gzip but a single gzip file.
+
+    To allow seek, a gzipped {1} must have each record compressed into
+    a single gzip chunk and concatenated together.
+
+    This file is likely still valid and you can use it by decompressing it:
+
+    gunzip myfile.{0}.gz
+
+    You can then also use the 'warc2warc' tool from the 'warc-tools'
+    package which will create a properly chunked gzip file:
+
+    warc2warc -Z myfile.{0} > myfile.{0}.gz
+"""
+
+    INC_RECORD = """\
+    WARNING: Record not followed by newline, perhaps Content-Length is invalid
+    Offset: {0}
+    Remainder: {1}
+"""
+
+
+    def __init__(self, fileobj, no_record_parse=False,
+                 verify_http=False):
+        self.fh = fileobj
+
+        self.loader = ArcWarcRecordLoader(verify_http=verify_http)
+        self.reader = None
+
+        self.offset = 0
+        self.known_format = None
+
+        self.member_info = None
+        self.no_record_parse = no_record_parse
+
+    def __call__(self, block_size=16384):
+        """ iterate over each record
+        """
+
+        decomp_type = 'gzip'
+
+        self.reader = DecompressingBufferedReader(self.fh,
+                                                  block_size=block_size)
+        self.offset = self.fh.tell()
+
+        self.next_line = None
+
+        raise_invalid_gzip = False
+        empty_record = False
+        record = None
+
+        while True:
+            try:
+                curr_offset = self.fh.tell()
+                record = self._next_record(self.next_line)
+                if raise_invalid_gzip:
+                    self._raise_invalid_gzip_err()
+
+                yield record
+
+            except EOFError:
+                empty_record = True
+
+            if record:
+                self.read_to_end(record)
+
+            if self.reader.decompressor:
+                # if another gzip member, continue
+                if self.reader.read_next_member():
+                    continue
+
+                # if empty record, then we're done
+                elif empty_record:
+                    break
+
+                # otherwise, probably a gzip
+                # containing multiple non-chunked records
+                # raise this as an error
+                else:
+                    raise_invalid_gzip = True
+
+            # non-gzip, so we're done
+            elif empty_record:
+                break
+
+    def _raise_invalid_gzip_err(self):
+        """ A gzip file with multiple ARC/WARC records, non-chunked
+        has been detected. This is not valid for replay, so notify user
+        """
+        frmt = 'warc/arc'
+        if self.known_format:
+            frmt = self.known_format
+
+        frmt_up = frmt.upper()
+
+        msg = self.GZIP_ERR_MSG.format(frmt, frmt_up)
+        raise Exception(msg)
+
+    def _consume_blanklines(self):
+        """ Consume blank lines that are between records
+        - For warcs, there are usually 2
+        - For arcs, may be 1 or 0
+        - For block gzipped files, these are at end of each gzip envelope
+          and are included in record length which is the full gzip envelope
+        - For uncompressed, they are between records and so are NOT part of
+          the record length
+
+          count empty_size so that it can be substracted from
+          the record length for uncompressed
+
+          if first line read is not blank, likely error in WARC/ARC,
+          display a warning
+        """
+        empty_size = 0
+        first_line = True
+
+        while True:
+            line = self.reader.readline()
+            if len(line) == 0:
+                return None, empty_size
+
+            stripped = line.rstrip()
+
+            if len(stripped) == 0 or first_line:
+                empty_size += len(line)
+
+                if len(stripped) != 0:
+                    # if first line is not blank,
+                    # likely content-length was invalid, display warning
+                    err_offset = self.fh.tell() - self.reader.rem_length() - empty_size
+                    sys.stderr.write(self.INC_RECORD.format(err_offset, line))
+
+                first_line = False
+                continue
+
+            return line, empty_size
+
+    def read_to_end(self, record, payload_callback=None):
+        """ Read remainder of the stream
+        If a digester is included, update it
+        with the data read
+        """
+
+        # already at end of this record, don't read until it is consumed
+        if self.member_info:
+            return None
+
+        num = 0
+        curr_offset = self.offset
+
+        while True:
+            b = record.stream.read(8192)
+            if not b:
+                break
+            num += len(b)
+            if payload_callback:
+                payload_callback(b)
+
+        """
+        - For compressed files, blank lines are consumed
+          since they are part of record length
+        - For uncompressed files, blank lines are read later,
+          and not included in the record length
+        """
+        #if self.reader.decompressor:
+        self.next_line, empty_size = self._consume_blanklines()
+
+        self.offset = self.fh.tell() - self.reader.rem_length()
+        #if self.offset < 0:
+        #    raise Exception('Not Gzipped Properly')
+
+        if self.next_line:
+            self.offset -= len(self.next_line)
+
+        length = self.offset - curr_offset
+
+        if not self.reader.decompressor:
+            length -= empty_size
+
+        self.member_info = (curr_offset, length)
+        #return self.member_info
+        #return next_line
+
+    def _next_record(self, next_line):
+        """ Use loader to parse the record from the reader stream
+        Supporting warc and arc records
+        """
+        record = self.loader.parse_record_stream(self.reader,
+                                                 next_line,
+                                                 self.known_format,
+                                                 self.no_record_parse)
+
+        self.member_info = None
+
+        # Track known format for faster parsing of other records
+        self.known_format = record.format
+
+        return record
+
+
+#=================================================================
+class ArchiveIndexEntryMixin(object):
+    MIME_RE = re.compile('[; ]')
+
+    def __init__(self):
+        super(ArchiveIndexEntryMixin, self).__init__()
+        self.reset_entry()
+
+    def reset_entry(self):
+        self['urlkey'] = ''
+        self['metadata'] = ''
+        self.buffer = None
+        self.record = None
+
+
+    def extract_mime(self, mime, def_mime='unk'):
+        """ Utility function to extract mimetype only
+        from a full content type, removing charset settings
+        """
+        self['mime'] = def_mime
+        if mime:
+            self['mime'] = self.MIME_RE.split(mime, 1)[0]
+            self['_content_type'] = mime
+
+    def extract_status(self, status_headers):
+        """ Extract status code only from status line
+        """
+        self['status'] = status_headers.get_statuscode()
+        if not self['status']:
+            self['status'] = '-'
+        elif self['status'] == '204' and 'Error' in status_headers.statusline:
+            self['status'] = '-'
+
+    def set_rec_info(self, offset, length):
+        self['length'] = str(length)
+        self['offset'] = str(offset)
+
+    def merge_request_data(self, other, options):
+        surt_ordered = options.get('surt_ordered', True)
+
+        if other.record.rec_type != 'request':
+            return False
+
+        # two requests, not correct
+        if self.record.rec_type == 'request':
+            return False
+
+        # merge POST/PUT body query
+        post_query = other.get('_post_query')
+        if post_query:
+            url = append_post_query(self['url'], post_query)
+            self['urlkey'] = canonicalize(url, surt_ordered)
+            other['urlkey'] = self['urlkey']
+
+        referer = other.record.status_headers.get_header('referer')
+        if referer:
+            self['_referer'] = referer
+
+        return True
+
+
+#=================================================================
+class DefaultRecordParser(object):
+    def __init__(self, **options):
+        self.options = options
+        self.entry_cache = {}
+        self.digester = None
+        self.buff = None
+
+    def _create_index_entry(self, rec_type):
+        try:
+            entry = self.entry_cache[rec_type]
+            entry.reset_entry()
+        except:
+            if self.options.get('cdxj'):
+                entry = OrderedArchiveIndexEntry()
+            else:
+                entry = ArchiveIndexEntry()
+
+            # don't reuse when using append post
+            # entry may be cached
+            if not self.options.get('append_post'):
+                self.entry_cache[rec_type] = entry
+
+        return entry
+
+    def begin_payload(self, compute_digest, entry):
+        if compute_digest:
+            self.digester = hashlib.sha1()
+        else:
+            self.digester = None
+
+        self.entry = entry
+        entry.buffer = self.create_payload_buffer(entry)
+
+    def handle_payload(self, buff):
+        if self.digester:
+            self.digester.update(buff)
+
+        if self.entry and self.entry.buffer:
+            self.entry.buffer.write(buff)
+
+    def end_payload(self, entry):
+        if self.digester:
+            entry['digest'] = base64.b32encode(self.digester.digest()).decode('ascii')
+
+        self.entry = None
+
+    def create_payload_buffer(self, entry):
+        return None
+
+    def create_record_iter(self, raw_iter):
+        append_post = self.options.get('append_post')
+        include_all = self.options.get('include_all')
+        block_size = self.options.get('block_size', 16384)
+        surt_ordered = self.options.get('surt_ordered', True)
+        minimal = self.options.get('minimal')
+
+        if append_post and minimal:
+            raise Exception('Sorry, minimal index option and ' +
+                            'append POST options can not be used together')
+
+        for record in raw_iter(block_size):
+            entry = None
+
+            if not include_all and not minimal and (record.status_headers.get_statuscode() == '-'):
+                continue
+
+            if record.format == 'warc':
+                if (record.rec_type in ('request', 'warcinfo') and
+                     not include_all and
+                     not append_post):
+                    continue
+
+                elif (not include_all and
+                      record.content_type == 'application/warc-fields'):
+                    continue
+
+                entry = self.parse_warc_record(record)
+            elif record.format == 'arc':
+                entry = self.parse_arc_record(record)
+
+            if not entry:
+                continue
+
+            if entry.get('url') and not entry.get('urlkey'):
+                entry['urlkey'] = canonicalize(entry['url'], surt_ordered)
+
+            compute_digest = False
+
+            if (entry.get('digest', '-') == '-' and
+                record.rec_type not in ('revisit', 'request', 'warcinfo')):
+
+                compute_digest = True
+
+            elif not minimal and record.rec_type == 'request' and append_post:
+                method = record.status_headers.protocol
+                len_ = record.status_headers.get_header('Content-Length')
+
+                post_query = extract_post_query(method,
+                                                entry.get('_content_type'),
+                                                len_,
+                                                record.stream)
+
+                entry['_post_query'] = post_query
+
+            entry.record = record
+
+            self.begin_payload(compute_digest, entry)
+            raw_iter.read_to_end(record, self.handle_payload)
+
+            entry.set_rec_info(*raw_iter.member_info)
+            self.end_payload(entry)
+
+            yield entry
+
+    def join_request_records(self, entry_iter):
+        prev_entry = None
+
+        for entry in entry_iter:
+            if not prev_entry:
+                prev_entry = entry
+                continue
+
+            # check for url match
+            if (entry['url'] != prev_entry['url']):
+                pass
+
+            # check for concurrency also
+            elif (entry.record.rec_headers.get_header('WARC-Concurrent-To') !=
+                  prev_entry.record.rec_headers.get_header('WARC-Record-ID')):
+                pass
+
+            elif (entry.merge_request_data(prev_entry, self.options) or
+                  prev_entry.merge_request_data(entry, self.options)):
+                yield prev_entry
+                yield entry
+                prev_entry = None
+                continue
+
+            yield prev_entry
+            prev_entry = entry
+
+        if prev_entry:
+            yield prev_entry
+
+
+    #=================================================================
+    def parse_warc_record(self, record):
+        """ Parse warc record
+        """
+
+        entry = self._create_index_entry(record.rec_type)
+
+        if record.rec_type == 'warcinfo':
+            entry['url'] = record.rec_headers.get_header('WARC-Filename')
+            entry['urlkey'] = entry['url']
+            entry['_warcinfo'] = record.stream.read(record.length)
+            return entry
+
+        entry['url'] = record.rec_headers.get_header('WARC-Target-Uri')
+
+        # timestamp
+        entry['timestamp'] = iso_date_to_timestamp(record.rec_headers.
+                                                   get_header('WARC-Date'))
+
+        # mime
+        if record.rec_type == 'revisit':
+            entry['mime'] = 'warc/revisit'
+        elif self.options.get('minimal'):
+            entry['mime'] = '-'
+        else:
+            def_mime = '-' if record.rec_type == 'request' else 'unk'
+            entry.extract_mime(record.status_headers.
+                               get_header('Content-Type'),
+                               def_mime)
+
+        # status -- only for response records (by convention):
+        if record.rec_type == 'response' and not self.options.get('minimal'):
+            entry.extract_status(record.status_headers)
+        else:
+            entry['status'] = '-'
+
+        # digest
+        digest = record.rec_headers.get_header('WARC-Payload-Digest')
+        entry['digest'] = digest
+        if digest and digest.startswith('sha1:'):
+            entry['digest'] = digest[len('sha1:'):]
+
+        elif not entry.get('digest'):
+            entry['digest'] = '-'
+
+        # optional json metadata, if present
+        metadata = record.rec_headers.get_header('WARC-Json-Metadata')
+        if metadata:
+            entry['metadata'] = metadata
+
+        return entry
+
+
+    #=================================================================
+    def parse_arc_record(self, record):
+        """ Parse arc record
+        """
+        if record.rec_type == 'arc_header':
+            return None
+
+        url = record.rec_headers.get_header('uri')
+        url = url.replace('\r', '%0D')
+        url = url.replace('\n', '%0A')
+        # replace formfeed
+        url = url.replace('\x0c', '%0C')
+        # replace nulls
+        url = url.replace('\x00', '%00')
+
+        entry = self._create_index_entry(record.rec_type)
+        entry['url'] = url
+
+        # timestamp
+        entry['timestamp'] = record.rec_headers.get_header('archive-date')
+        if len(entry['timestamp']) > 14:
+            entry['timestamp'] = entry['timestamp'][:14]
+
+        if not self.options.get('minimal'):
+            # mime
+            entry.extract_mime(record.rec_headers.get_header('content-type'))
+
+            # status
+            entry.extract_status(record.status_headers)
+
+        # digest
+        entry['digest'] = '-'
+
+        return entry
+
+    def __call__(self, fh):
+        aiter = ArchiveIterator(fh, self.options.get('minimal', False),
+                                    self.options.get('verify_http', False))
+
+        entry_iter = self.create_record_iter(aiter)
+
+        if self.options.get('append_post'):
+            entry_iter = self.join_request_records(entry_iter)
+
+        for entry in entry_iter:
+            if (entry.record.rec_type in ('request', 'warcinfo') and
+                 not self.options.get('include_all')):
+                continue
+
+            yield entry
+
+    def open(self, filename):
+        with open(filename, 'rb') as fh:
+            for entry in self(fh):
+                yield entry
+
+class ArchiveIndexEntry(ArchiveIndexEntryMixin, dict):
+    pass
+
+class OrderedArchiveIndexEntry(ArchiveIndexEntryMixin, OrderedDict):
+    pass
+
+# end pywb.warc.archiveiterator
+
+# begin pywb.warc.cdxIndexer
+#=================================================================
+class BaseCDXWriter(object):
+    def __init__(self, out):
+        self.out = codecs.getwriter('utf-8')(out)
+        #self.out = out
+
+    def __enter__(self):
+        self._write_header()
+        return self
+
+    def write(self, entry, filename):
+        if not entry.get('url') or not entry.get('urlkey'):
+            return
+
+        if entry.record.rec_type == 'warcinfo':
+            return
+
+        self.write_cdx_line(self.out, entry, filename)
+
+    def __exit__(self, *args):
+        return False
+
+
+#=================================================================
+class CDXJ(object):
+    def _write_header(self):
+        pass
+
+    def write_cdx_line(self, out, entry, filename):
+        out.write(entry['urlkey'])
+        out.write(' ')
+        out.write(entry['timestamp'])
+        out.write(' ')
+
+        outdict = OrderedDict()
+
+        for n, v in six.iteritems(entry):
+            if n in ('urlkey', 'timestamp'):
+                continue
+
+            if n.startswith('_'):
+                continue
+
+            if not v or v == '-':
+                continue
+
+            outdict[n] = v
+
+        outdict['filename'] = filename
+        out.write(json_encode(outdict))
+        out.write('\n')
+
+
+#=================================================================
+class CDX09(object):
+    def _write_header(self):
+        self.out.write(' CDX N b a m s k r V g\n')
+
+    def write_cdx_line(self, out, entry, filename):
+        out.write(entry['urlkey'])
+        out.write(' ')
+        out.write(entry['timestamp'])
+        out.write(' ')
+        out.write(entry['url'])
+        out.write(' ')
+        out.write(entry['mime'])
+        out.write(' ')
+        out.write(entry['status'])
+        out.write(' ')
+        out.write(entry['digest'])
+        out.write(' - ')
+        out.write(entry['offset'])
+        out.write(' ')
+        out.write(filename)
+        out.write('\n')
+
+
+#=================================================================
+class CDX11(object):
+    def _write_header(self):
+        self.out.write(' CDX N b a m s k r M S V g\n')
+
+    def write_cdx_line(self, out, entry, filename):
+        out.write(entry['urlkey'])
+        out.write(' ')
+        out.write(entry['timestamp'])
+        out.write(' ')
+        out.write(entry['url'])
+        out.write(' ')
+        out.write(entry['mime'])
+        out.write(' ')
+        out.write(entry['status'])
+        out.write(' ')
+        out.write(entry['digest'])
+        out.write(' - - ')
+        out.write(entry['length'])
+        out.write(' ')
+        out.write(entry['offset'])
+        out.write(' ')
+        out.write(filename)
+        out.write('\n')
+
+
+#=================================================================
+class SortedCDXWriter(BaseCDXWriter):
+    def __enter__(self):
+        self.sortlist = []
+        res = super(SortedCDXWriter, self).__enter__()
+        self.actual_out = self.out
+        return res
+
+    def write(self, entry, filename):
+        self.out = StringIO()
+        super(SortedCDXWriter, self).write(entry, filename)
+        line = self.out.getvalue()
+        if line:
+            insort(self.sortlist, line)
+
+    def __exit__(self, *args):
+        self.actual_out.write(''.join(self.sortlist))
+        return False
+
+
+#=================================================================
+ALLOWED_EXT = ('.arc', '.arc.gz', '.warc', '.warc.gz')
+
+
+#=================================================================
+def _resolve_rel_path(path, rel_root):
+    path = os.path.relpath(path, rel_root)
+    if os.path.sep != '/':  #pragma: no cover
+        path = path.replace(os.path.sep, '/')
+    return path
+
+
+#=================================================================
+def iter_file_or_dir(inputs, recursive=True, rel_root=None):
+    for input_ in inputs:
+        if not os.path.isdir(input_):
+            if not rel_root:
+                filename = os.path.basename(input_)
+            else:
+                filename = _resolve_rel_path(input_, rel_root)
+
+            yield input_, filename
+
+        elif not recursive:
+            for filename in os.listdir(input_):
+                if filename.endswith(ALLOWED_EXT):
+                    full_path = os.path.join(input_, filename)
+                    if rel_root:
+                        filename = _resolve_rel_path(full_path, rel_root)
+                    yield full_path, filename
+
+        else:
+            for root, dirs, files in os.walk(input_):
+                for filename in files:
+                    if filename.endswith(ALLOWED_EXT):
+                        full_path = os.path.join(root, filename)
+                        if not rel_root:
+                            rel_root = input_
+                        rel_path = _resolve_rel_path(full_path, rel_root)
+                        yield full_path, rel_path
+
+
+#=================================================================
+def remove_ext(filename):
+    for ext in ALLOWED_EXT:
+        if filename.endswith(ext):
+            filename = filename[:-len(ext)]
+            break
+
+    return filename
+
+
+#=================================================================
+def cdx_filename(filename):
+    return remove_ext(filename) + '.cdx'
+
+
+#=================================================================
+def get_cdx_writer_cls(options):
+    if options.get('minimal'):
+        options['cdxj'] = True
+
+    writer_cls = options.get('writer_cls')
+    if writer_cls:
+        if not options.get('writer_add_mixin'):
+            return writer_cls
+    elif options.get('sort'):
+        writer_cls = SortedCDXWriter
+    else:
+        writer_cls = BaseCDXWriter
+
+    if options.get('cdxj'):
+        format_mixin = CDXJ
+    elif options.get('cdx09'):
+        format_mixin = CDX09
+    else:
+        format_mixin = CDX11
+
+    class CDXWriter(writer_cls, format_mixin):
+        pass
+
+    return CDXWriter
+
+
+#=================================================================
+def write_multi_cdx_index(output, inputs, **options):
+    recurse = options.get('recurse', False)
+    rel_root = options.get('rel_root')
+
+    # write one cdx per dir
+    if output != '-' and os.path.isdir(output):
+        for fullpath, filename in iter_file_or_dir(inputs,
+                                                   recurse,
+                                                   rel_root):
+            outpath = cdx_filename(filename)
+            outpath = os.path.join(output, outpath)
+
+            with open(outpath, 'wb') as outfile:
+                with open(fullpath, 'rb') as infile:
+                    writer = write_cdx_index(outfile, infile, filename,
+                                             **options)
+
+        return writer
+
+    # write to one cdx file
+    else:
+        if output == '-':
+            if hasattr(sys.stdout, 'buffer'):
+                outfile = sys.stdout.buffer
+            else:
+                outfile = sys.stdout
+        else:
+            outfile = open(output, 'wb')
+
+        writer_cls = get_cdx_writer_cls(options)
+        record_iter = DefaultRecordParser(**options)
+
+        with writer_cls(outfile) as writer:
+            for fullpath, filename in iter_file_or_dir(inputs,
+                                                       recurse,
+                                                       rel_root):
+                with open(fullpath, 'rb') as infile:
+                    entry_iter = record_iter(infile)
+
+                    for entry in entry_iter:
+                        writer.write(entry, filename)
+
+        return writer
+
+
+#=================================================================
+def write_cdx_index(outfile, infile, filename, **options):
+    #filename = filename.encode(sys.getfilesystemencoding())
+
+    writer_cls = get_cdx_writer_cls(options)
+
+    with writer_cls(outfile) as writer:
+        entry_iter = DefaultRecordParser(**options)(infile)
+
+        for entry in entry_iter:
+            writer.write(entry, filename)
+
+    return writer
+
+
+# end pywb.warc.cdxIndexer
+
 # begin pywb.cdx.cdxobject
 # =================================================================
 class CDXObject(OrderedDict):
@@ -4782,6 +5596,409 @@ def create_cdx_server(config, ds_rules_file=None, server_cls=None):
 
 # end pywb.cdx.cdxserver
 
+# begin pywb.manager.migrate
+class MigrateCDX(object):
+    def __init__(self, dir_):
+        self.cdx_dir = dir_
+
+    def iter_cdx_files(self):
+        for root, dirs, files in os.walk(self.cdx_dir):
+            for filename in files:
+                if filename.endswith('.cdx'):
+                    full_path = os.path.join(root, filename)
+                    yield full_path
+
+    def count_cdx(self):
+        count = 0
+        for x in self.iter_cdx_files():
+            count += 1
+        return count
+
+    def convert_to_cdxj(self):
+        cdxj_writer = CDXJ()
+        for filename in self.iter_cdx_files():
+            outfile = filename + 'j'
+
+            print('Converting {0} -> {1}'.format(filename, outfile))
+
+            with open(outfile + '.tmp', 'w+') as out:
+                with open(filename, 'rb') as fh:
+                    for line in fh:
+                        if line.startswith(b' CDX'):
+                            continue
+                        cdx = CDXObject(line)
+                        cdx[URLKEY] = canonicalize(cdx[ORIGINAL])
+                        cdxj_writer.write_cdx_line(out, cdx, cdx['filename'])
+
+            shutil.move(outfile + '.tmp', outfile)
+            os.remove(filename)
+# end pywb.manager.migrate
+
+# begin pywb.manager.autoindex
+#=============================================================================
+class CDXAutoIndexer(RegexMatchingEventHandler):
+    def __init__(self, updater, path):
+        super(CDXAutoIndexer, self).__init__(regexes=[EXT_REGEX],
+                                             ignore_directories=True)
+        self.updater = updater
+        self.cdx_path = path
+
+    def on_created(self, event):
+        self.updater(event.src_path)
+
+    def on_modified(self, event):
+        self.updater(event.src_path)
+
+    def start_watch(self):
+        self.observer = Observer()
+        self.observer.schedule(self, self.cdx_path, recursive=True)
+        self.observer.start()
+
+    def do_loop(self, sleep_time=1):
+        try:
+            while keep_running:
+                time.sleep(sleep_time)
+        except KeyboardInterrupt:  # pragma: no cover
+            self.observer.stop()
+            self.observer.join()
+
+
+# end pywb.manager.autoindex
+
+# begin pywb.manager.manager
+#=============================================================================
+# to allow testing by mocking get_input
+def get_input(msg):  #pragma: no cover
+    return raw_input(msg)
+
+
+#=============================================================================
+class CollectionsManager(object):
+    """ This utility is designed to
+simplify the creation and management of web archive collections
+
+It may be used via cmdline to setup and maintain the
+directory structure expected by pywb
+    """
+    DEF_INDEX_FILE = 'index.cdxj'
+    AUTO_INDEX_FILE = 'autoindex.cdxj'
+
+    COLL_RX = re.compile('^[\w][-\w]*$')
+
+    def __init__(self, coll_name, colls_dir='collections', must_exist=True):
+        self.default_config = load_yaml_config(DEFAULT_CONFIG)
+
+        if coll_name and not self.COLL_RX.match(coll_name):
+            raise ValueError('Invalid Collection Name: ' + coll_name)
+
+        self.colls_dir = os.path.join(os.getcwd(), colls_dir)
+
+        self._set_coll_dirs(coll_name)
+
+        if must_exist:
+            self._assert_coll_exists()
+
+    def _set_coll_dirs(self, coll_name):
+        self.coll_name = coll_name
+        self.curr_coll_dir = os.path.join(self.colls_dir, coll_name)
+
+        self.archive_dir = self._get_dir('archive_paths')
+
+        self.indexes_dir = self._get_dir('index_paths')
+        self.static_dir = self._get_dir('static_path')
+        self.templates_dir = self._get_dir('templates_dir')
+
+    def list_colls(self):
+        print('Collections:')
+        if not os.path.isdir(self.colls_dir):
+            msg = ('"Collections" directory not found. ' +
+                   'To create a new collection, run:\n\n{0} init <name>')
+            raise IOError(msg.format(sys.argv[0]))
+        for d in os.listdir(self.colls_dir):
+            if os.path.isdir(os.path.join(self.colls_dir, d)):
+                print('- ' + d)
+
+    def _get_root_dir(self, name):
+        return os.path.join(os.getcwd(),
+                            self.default_config['paths'][name])
+
+    def _get_dir(self, name):
+        return os.path.join(self.curr_coll_dir,
+                            self.default_config['paths'][name])
+
+    def _create_dir(self, dirname):
+        if not os.path.isdir(dirname):
+            os.mkdir(dirname)
+
+        logging.info('Created Directory: ' + dirname)
+
+    def add_collection(self):
+        os.makedirs(self.curr_coll_dir)
+        logging.info('Created Directory: ' + self.curr_coll_dir)
+
+        self._create_dir(self.archive_dir)
+        self._create_dir(self.indexes_dir)
+        self._create_dir(self.static_dir)
+        self._create_dir(self.templates_dir)
+
+        self._create_dir(self._get_root_dir('static_path'))
+        self._create_dir(self._get_root_dir('templates_dir'))
+
+    def _assert_coll_exists(self):
+        if not os.path.isdir(self.curr_coll_dir):
+            msg = ('Collection {0} does not exist. ' +
+                   'To create a new collection, run\n\n{1} init {0}')
+            raise IOError(msg.format(self.coll_name, sys.argv[0]))
+
+    def add_warcs(self, warcs):
+        if not os.path.isdir(self.archive_dir):
+            raise IOError('Directory {0} does not exist'.
+                          format(self.archive_dir))
+
+        full_paths = []
+        for filename in warcs:
+            filename = os.path.abspath(filename)
+            shutil.copy2(filename, self.archive_dir)
+            full_paths.append(os.path.join(self.archive_dir, filename))
+            logging.info('Copied ' + filename + ' to ' + self.archive_dir)
+
+        self._index_merge_warcs(full_paths, self.DEF_INDEX_FILE)
+
+    def reindex(self):
+        cdx_file = os.path.join(self.indexes_dir, self.DEF_INDEX_FILE)
+        logging.info('Indexing ' + self.archive_dir + ' to ' + cdx_file)
+        self._cdx_index(cdx_file, [self.archive_dir])
+
+    def _cdx_index(self, out, input_, rel_root=None):
+        options = dict(append_post=True,
+                       cdxj=True,
+                       sort=True,
+                       recurse=True,
+                       rel_root=rel_root)
+
+        write_multi_cdx_index(out, input_, **options)
+
+    def index_merge(self, filelist, index_file):
+        wrongdir = 'Skipping {0}, must be in {1} archive directory'
+        notfound = 'Skipping {0}, file not found'
+
+        filtered_warcs = []
+
+        # Check that warcs are actually in archive dir
+        abs_archive_dir = os.path.abspath(self.archive_dir)
+
+        for f in filelist:
+            abs_filepath = os.path.abspath(f)
+            prefix = os.path.commonprefix([abs_archive_dir, abs_filepath])
+
+            if prefix != abs_archive_dir:
+                raise IOError(wrongdir.format(abs_filepath, abs_archive_dir))
+            elif not os.path.isfile(abs_filepath):
+                raise IOError(notfound.format(f))
+            else:
+                filtered_warcs.append(abs_filepath)
+
+        self._index_merge_warcs(filtered_warcs, index_file, abs_archive_dir)
+
+    def _index_merge_warcs(self, new_warcs, index_file, rel_root=None):
+        cdx_file = os.path.join(self.indexes_dir, index_file)
+
+        temp_file = cdx_file + '.tmp.' + timestamp20_now()
+        self._cdx_index(temp_file, new_warcs, rel_root)
+
+        # no existing file, so just make it the new file
+        if not os.path.isfile(cdx_file):
+            shutil.move(temp_file, cdx_file)
+            return
+
+        merged_file = temp_file + '.merged'
+
+        last_line = None
+
+        with open(cdx_file, 'rb') as orig_index:
+            with open(temp_file, 'rb') as new_index:
+                with open(merged_file, 'w+b') as merged:
+                    for line in heapq.merge(orig_index, new_index):
+                        if last_line != line:
+                            merged.write(line)
+                            last_line = line
+
+        shutil.move(merged_file, cdx_file)
+        #os.rename(merged_file, cdx_file)
+        os.remove(temp_file)
+
+    def set_metadata(self, namevalue_pairs):
+        metadata_yaml = os.path.join(self.curr_coll_dir, 'metadata.yaml')
+        metadata = None
+        if os.path.isfile(metadata_yaml):
+            with open(metadata_yaml, 'rb') as fh:
+                metadata = yaml.safe_load(fh)
+
+        if not metadata:
+            metadata = {}
+
+        msg = 'Metadata params must be in the form "name=value"'
+        for pair in namevalue_pairs:
+            v = pair.split('=', 1)
+            if len(v) != 2:
+                raise ValueError(msg)
+
+            print('Set {0}={1}'.format(v[0], v[1]))
+            metadata[v[0]] = v[1]
+
+        with open(metadata_yaml, 'w+b') as fh:
+            fh.write(yaml.dump(metadata, default_flow_style=False).encode('utf-8'))
+
+    def _load_templates_map(self):
+        defaults = load_yaml_config(DEFAULT_CONFIG)
+
+        temp_dir = defaults['paths']['templates_dir']
+
+        # Coll Templates
+        templates = defaults['paths']['template_files']
+
+        for name, _ in six.iteritems(templates):
+            templates[name] = os.path.join(temp_dir, defaults[name])
+
+        # Shared Templates
+        shared_templates = defaults['paths']['shared_template_files']
+
+        for name, _ in six.iteritems(shared_templates):
+            shared_templates[name] = os.path.join(temp_dir, defaults[name])
+
+        return templates, shared_templates
+
+    def list_templates(self):
+        templates, shared_templates = self._load_templates_map()
+
+        print('Shared Templates')
+        for n, v in six.iteritems(shared_templates):
+            print('- {0}: (pywb/{1})'.format(n, v))
+
+        print('')
+
+        print('Collection Templates')
+        for n, v in six.iteritems(templates):
+            print('- {0}: (pywb/{1})'.format(n, v))
+
+    def _confirm_overwrite(self, full_path, msg):
+        if not os.path.isfile(full_path):
+            return True
+
+        res = get_input(msg)
+        try:
+            res = strtobool(res)
+        except ValueError:
+            res = False
+
+        if not res:
+            raise IOError('Skipping, {0} already exists'.format(full_path))
+
+    def _get_template_path(self, template_name, verb):
+        templates, shared_templates = self._load_templates_map()
+
+        try:
+            filename = templates[template_name]
+            if not self.coll_name:
+                full_path = os.path.join(os.getcwd(), filename)
+            else:
+                full_path = os.path.join(self.templates_dir,
+                                         os.path.basename(filename))
+
+        except KeyError:
+            try:
+                filename = shared_templates[template_name]
+                full_path = os.path.join(os.getcwd(), filename)
+
+            except KeyError:
+                msg = 'template name must be one of {0} or {1}'
+                msg = msg.format(templates.keys(), shared_templates.keys())
+                raise KeyError(msg)
+
+        return full_path, filename
+
+    def add_template(self, template_name, force=False):
+        full_path, filename = self._get_template_path(template_name, 'add')
+
+        msg = ('Template file "{0}" ({1}) already exists. ' +
+               'Overwrite with default template? (y/n) ')
+        msg = msg.format(full_path, template_name)
+
+        if not force:
+            self._confirm_overwrite(full_path, msg)
+
+        data = resource_string('pywb', filename)
+        with open(full_path, 'w+b') as fh:
+            fh.write(data)
+
+        full_path = os.path.abspath(full_path)
+        msg = 'Copied default template "{0}" to "{1}"'
+        print(msg.format(filename, full_path))
+
+    def remove_template(self, template_name, force=False):
+        full_path, filename = self._get_template_path(template_name, 'remove')
+
+        if not os.path.isfile(full_path):
+            msg = 'Template "{0}" does not exist.'
+            raise IOError(msg.format(full_path))
+
+        msg = 'Delete template file "{0}" ({1})? (y/n) '
+        msg = msg.format(full_path, template_name)
+
+        if not force:
+            self._confirm_overwrite(full_path, msg)
+
+        os.remove(full_path)
+        print('Removed template file "{0}"'.format(full_path))
+
+    def migrate_cdxj(self, path, force=False):
+        migrate = MigrateCDX(path)
+        count = migrate.count_cdx()
+        if count == 0:
+            print('Index files up-to-date, nothing to convert')
+            return
+
+        msg = 'Convert {0} index files? (y/n)'.format(count)
+        if not force:
+            res = get_input(msg)
+            try:
+                res = strtobool(res)
+            except ValueError:
+                res = False
+
+            if not res:
+                return
+
+        migrate.convert_to_cdxj()
+
+    def autoindex(self, do_loop=True):
+        if self.coll_name:
+            any_coll = False
+            path = self.archive_dir
+        else:
+            path = self.colls_dir
+            any_coll = True
+
+        def do_index(warc):
+            if any_coll:
+                coll_name = warc.split(self.colls_dir + os.path.sep)
+                coll_name = coll_name[-1].split(os.path.sep)[0]
+
+                if coll_name != self.coll_name:
+                    self._set_coll_dirs(coll_name)
+
+            print('Auto-Indexing: ' + warc)
+            self.index_merge([warc], self.AUTO_INDEX_FILE)
+            print('Done.. Waiting for file updates')
+
+
+        indexer = CDXAutoIndexer(do_index, path)
+        indexer.start_watch()
+        if do_loop:
+            indexer.do_loop()
+
+# end pywb.manager.manager
+
 # begin pywb.perms.perms_filter
 # =================================================================
 def make_perms_cdx_filter(perms_policy, wbrequest):
@@ -5108,7 +6325,7 @@ class HeaderRewriter(object):
         new_headers = result[0]
         removed_header_dict = result[1]
 
-        if http_cache != None and http_cache != 'pass':
+        if http_cache is not None and http_cache != 'pass':
             self._add_cache_headers(new_headers, http_cache)
 
         return RewrittenStatusAndHeaders(status_headers.statusline,
@@ -8828,35 +10045,6 @@ class ReplayView(object):
 
     @staticmethod
     def strip_scheme_www(url):
-        """
-        >>> ReplayView.strip_scheme_www('https://example.com') ==\
-            ReplayView.strip_scheme_www('http://example.com')
-        True
-
-        >>> ReplayView.strip_scheme_www('https://example.com') ==\
-            ReplayView.strip_scheme_www('http:/example.com')
-        True
-
-        >>> ReplayView.strip_scheme_www('https://example.com') ==\
-            ReplayView.strip_scheme_www('example.com')
-        True
-
-        >>> ReplayView.strip_scheme_www('https://example.com') ==\
-            ReplayView.strip_scheme_www('http://www2.example.com')
-        True
-
-        >>> ReplayView.strip_scheme_www('about://example.com') ==\
-            ReplayView.strip_scheme_www('example.com')
-        True
-
-        >>> ReplayView.strip_scheme_www('http://') ==\
-            ReplayView.strip_scheme_www('')
-        True
-
-        >>> ReplayView.strip_scheme_www('#!@?') ==\
-            ReplayView.strip_scheme_www('#!@?')
-        True
-        """
         m = ReplayView.STRIP_SCHEME_WWW.match(url)
         match = m.group(2)
         return match
@@ -8867,10 +10055,6 @@ class ReplayView(object):
 # begin pywb.webapp.handlers
 # =================================================================
 class SearchPageWbUrlHandler(WbUrlHandler):
-    """
-    Loads a default search page html template to be shown when
-    the wb_url is empty
-    """
 
     def __init__(self, config):
         self.search_view = init_view(config, 'search_html')
@@ -10072,10 +11256,133 @@ def start_wsgi_ref_server(the_app, name, port):  # pragma: no cover
 
 # end pywb.framework.wsgi_wrappers
 
+
+# begin pywb.apps.cli
+#=================================================================
+def cdx_server(args=None):  #pragma: no cover
+    CdxCli(args=args,
+           default_port=8080,
+           desc='pywb CDX Index Server').run()
+
+
+#=================================================================
+def live_rewrite_server(args=None):  #pragma: no cover
+    LiveCli(args=args,
+            default_port=8090,
+            desc='pywb Live Rewrite Proxy Server').run()
+
+
+#=================================================================
+def wayback(args=None):
+    WaybackCli(args=args,
+               default_port=8080,
+               desc='pywb Wayback Web Archive Replay').run()
+
+
+#=============================================================================
+class BaseCli(object):
+    def __init__(self, args=None, default_port=8080, desc=''):
+        parser = ArgumentParser(desc)
+        parser.add_argument('-p', '--port', type=int, default=default_port)
+        parser.add_argument('-t', '--threads', type=int, default=4)
+        parser.add_argument('-s', '--server')
+
+        self.desc = desc
+
+        self._extend_parser(parser)
+
+        self.r = parser.parse_args(args)
+
+        self.application = self.load()
+
+    def _extend_parser(self, parser):  #pragma: no cover
+        pass
+
+    def load(self):  #pragma: no cover
+        pass
+
+    def run(self):
+        if self.r.server == 'waitress':  #pragma: no cover
+            self.run_waitress()
+        else:
+            self.run_wsgiref()
+
+    def run_waitress(self):  #pragma: no cover
+        from waitress import serve
+        print(self.desc)
+        serve(self.application, port=self.r.port, threads=self.r.threads)
+
+    def run_wsgiref(self):  #pragma: no cover
+        start_wsgi_ref_server(self.application, self.desc, port=self.r.port)
+
+
+#=============================================================================
+class LiveCli(BaseCli):
+    def _extend_parser(self, parser):
+        parser.add_argument('-x', '--proxy',
+                            help='Specify host:port to use as HTTP/S proxy')
+
+        parser.add_argument('-f', '--framed', action='store_true',
+                            help='Replay using framed wrapping mode')
+
+    def load(self):
+        config = dict(proxyhostport=self.r.proxy,
+                      framed_replay='inverse' if self.r.framed else False,
+                      enable_auto_colls=False,
+                      collections={'live': '$liveweb'})
+
+        return init_app(create_wb_router, load_yaml=False, config=config)
+
+
+#=============================================================================
+class ReplayCli(BaseCli):
+    def _extend_parser(self, parser):
+        parser.add_argument('-a', '--autoindex', action='store_true')
+
+        help_dir='Specify root archive dir (default is current working directory)'
+        parser.add_argument('-d', '--directory', help=help_dir)
+
+
+    def load(self):
+        if self.r.directory:  #pragma: no cover
+            os.chdir(self.r.directory)
+
+    def run(self):
+        if self.r.autoindex:
+            m = CollectionsManager('', must_exist=False)
+            if not os.path.isdir(m.colls_dir):
+                msg = 'No managed directory "{0}" for auto-indexing'
+                logging.error(msg.format(m.colls_dir))
+                sys.exit(2)
+            else:
+                msg = 'Auto-Indexing Enabled on "{0}"'
+                logging.info(msg.format(m.colls_dir))
+                m.autoindex(do_loop=False)
+
+        super(ReplayCli, self).run()
+
+#=============================================================================
+class CdxCli(ReplayCli):  #pragma: no cover
+    def load(self):
+        super(CdxCli, self).load()
+        return init_app(create_cdx_server_app,
+                        load_yaml=True)
+
+
+#=============================================================================
+class WaybackCli(ReplayCli):
+    def load(self):
+        super(WaybackCli, self).load()
+        return init_app(create_wb_router,
+                        load_yaml=True)
+
+# end pywb.apps.cli
+
+
 # =================================================================
 # init pywb app
 # =================================================================
-
-BlockLoader.init_default_loaders()
-
-application = init_app(create_wb_router, load_yaml=True)
+#=============================================================================
+if __name__ == "__main__":
+    multiprocessing.freeze_support()
+    wayback()

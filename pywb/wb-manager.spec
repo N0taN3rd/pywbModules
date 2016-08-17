@@ -4,13 +4,13 @@ block_cipher = None
 
 
 added_files = [
-  ('/home/john/Desktop/pywbModules/wbManager/*.yaml', '.'),
+  ('/home/john/Desktop/pywbModules/pywb/*.yaml', '.'),
   ('/home/john/Desktop/pywbModules/static/','static'),
   ('/home/john/Desktop/pywbModules/templates/','templates')
 ]
 
 a = Analysis(['wb-manager.py'],
-             pathex=['/home/john/Desktop/pywbModules/wbManager/'],
+             pathex=['/home/john/Desktop/pywbModules/pywb/'],
              binaries=None,
              datas=added_files,
              hiddenimports=[],
@@ -25,7 +25,7 @@ pyz = PYZ(a.pure, a.zipped_data,
 exe = EXE(pyz,
           a.scripts,
           exclude_binaries=True,
-          name='wbManager',
+          name='wb-manager',
           debug=False,
           strip=False,
           upx=True,

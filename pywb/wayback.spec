@@ -2,15 +2,15 @@
 
 block_cipher = None
 
-
 added_files = [
-  ('/home/john/Desktop/pywbModules/wbManager/*.yaml', '.'),
-  ('/home/john/Desktop/pywbModules/static/','static'),
-  ('/home/john/Desktop/pywbModules/templates/','templates')
+  ('/home/john/Desktop/pywbModules/pywb/*.yaml', '.'),
+  ('/home/john/Desktop/pywbModules/static','static'),
+  ('/home/john/Desktop/pywbModules/templates','templates'),
+  ('/home/john/Desktop/pywbModules/sample_archive','sample_archive'),
 ]
 
-a = Analysis(['wb-manager.py'],
-             pathex=['/home/john/Desktop/pywbModules/wbManager/'],
+a = Analysis(['wayback.py'],
+             pathex=['/home/john/Desktop/pywbModules/pywb'],
              binaries=None,
              datas=added_files,
              hiddenimports=[],
@@ -25,7 +25,7 @@ pyz = PYZ(a.pure, a.zipped_data,
 exe = EXE(pyz,
           a.scripts,
           exclude_binaries=True,
-          name='wbManager',
+          name='wayback',
           debug=False,
           strip=False,
           upx=True,
@@ -36,4 +36,4 @@ coll = COLLECT(exe,
                a.datas,
                strip=False,
                upx=True,
-               name='wb-manager')
+               name='pywb')
