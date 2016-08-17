@@ -2,15 +2,20 @@
 
 block_cipher = None
 
+import os, os.path
+
+here = os.path.abspath(os.path.join(os.getcwd(), os.pardir))
+print(here)
+
 added_files = [
-  ('/home/john/Desktop/pywbModules/pywb/*.yaml', '.'),
-  ('/home/john/Desktop/pywbModules/static','static'),
-  ('/home/john/Desktop/pywbModules/templates','templates'),
-  ('/home/john/Desktop/pywbModules/sample_archive','sample_archive'),
+  ('%s/pywb/*.yaml'%here, '.'),
+  ('%s/static'%here,'static'),
+  ('%s/templates'%here,'templates'),
+  ('%s/sample_archive'%here,'sample_archive'),
 ]
 
 a = Analysis(['wayback.py'],
-             pathex=['/home/john/Desktop/pywbModules/pywb'],
+             pathex=['%s/pywb'%here],
              binaries=None,
              datas=added_files,
              hiddenimports=[],

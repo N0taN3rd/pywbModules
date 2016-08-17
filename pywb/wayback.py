@@ -443,7 +443,7 @@ class BlockLoader(BaseLoader):
 
     def __init__(self, **kwargs):
         self.cached = {}
-        self.kwargs = kwargss
+        self.kwargs = kwargs
 
     def load(self, url, offset=0, length=-1):
         loader, url = self._get_loader_for_url(url)

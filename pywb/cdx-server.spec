@@ -1,11 +1,12 @@
 # -*- mode: python -*-
-
-block_cipher = None
-
 import os, os.path
 
 here = os.path.abspath(os.path.join(os.getcwd(), os.pardir))
 print(here)
+
+block_cipher = None
+
+
 
 added_files = [
   ('%s/pywb/*.yaml'%here, '.'),
@@ -13,11 +14,10 @@ added_files = [
   ('%s/templates/'%here,'templates')
 ]
 
-
-a = Analysis(['wb-manager.py'],
+a = Analysis(['cdx-server.py'],
              pathex=['%s/pywb'%here],
              binaries=None,
-             datas=added_files,
+             datas=None,
              hiddenimports=[],
              hookspath=[],
              runtime_hooks=[],
@@ -30,7 +30,7 @@ pyz = PYZ(a.pure, a.zipped_data,
 exe = EXE(pyz,
           a.scripts,
           exclude_binaries=True,
-          name='wb-manager',
+          name='cdx-server',
           debug=False,
           strip=False,
           upx=True,
@@ -41,4 +41,4 @@ coll = COLLECT(exe,
                a.datas,
                strip=False,
                upx=True,
-               name='wb-manager')
+               name='cdx-server')

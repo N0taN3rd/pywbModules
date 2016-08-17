@@ -14,7 +14,7 @@ added_files = [
 ]
 
 
-a = Analysis(['wb-manager.py'],
+a = Analysis(['cdxindexer.py'],
              pathex=['%s/pywb'%here],
              binaries=None,
              datas=added_files,
@@ -30,7 +30,7 @@ pyz = PYZ(a.pure, a.zipped_data,
 exe = EXE(pyz,
           a.scripts,
           exclude_binaries=True,
-          name='wb-manager',
+          name='cdxindexer',
           debug=False,
           strip=False,
           upx=True,
@@ -41,4 +41,4 @@ coll = COLLECT(exe,
                a.datas,
                strip=False,
                upx=True,
-               name='wb-manager')
+               name='cdxindexer')
