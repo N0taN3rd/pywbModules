@@ -10,7 +10,8 @@ print(here)
 added_files = [
   ('%s/pywb/*.yaml'%here, '.'),
   ('%s/static/'%here,'static'),
-  ('%s/templates/'%here,'templates')
+  ('%s/templates/'%here,'templates'),
+  ('%s/pywb/uwsgi.ini'%here,'.')
 ]
 
 

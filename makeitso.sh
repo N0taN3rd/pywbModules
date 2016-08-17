@@ -21,14 +21,14 @@ clean () {
 
 clean
 
-if [[ -d "temp" ]]; then
-  rm -rf temp
+if [[ -d "dist" ]]; then
+  rm -rf dist
 fi
 
-mkdir -p temp/pywb
+mkdir -p dist/pywb
 
 
-tempDir="$here/temp/pywb"
+distDir="$here/dist/pywb"
 
 cd pywb
 
@@ -42,10 +42,10 @@ do
 
   if [[ "$filename" == "wayback" ]]; then
       chmod a+x "dist/pywb/pywb"
-      cp -RT dist/pywb ${tempDir}
+      cp -RT dist/pywb ${distDir}
   else
       chmod a+x "dist/$filename/$filename"
-      cp "dist/$filename/$filename" $tempDir
+      cp "dist/$filename/$filename" $distDir
   fi
 done
 

@@ -12,6 +12,7 @@ added_files = [
   ('%s/static'%here,'static'),
   ('%s/templates'%here,'templates'),
   ('%s/sample_archive'%here,'sample_archive'),
+  ('%s/pywb/uwsgi.ini'%here,'.')
 ]
 
 a = Analysis(['wayback.py'],

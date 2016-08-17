@@ -11,7 +11,8 @@ block_cipher = None
 added_files = [
   ('%s/pywb/*.yaml'%here, '.'),
   ('%s/static/'%here,'static'),
-  ('%s/templates/'%here,'templates')
+  ('%s/templates/'%here,'templates'),
+  ('%s/pywb/uwsgi.ini'%here,'.')
 ]
 
 a = Analysis(['cdx-server.py'],
