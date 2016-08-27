@@ -10767,7 +10767,7 @@ def init_route_config(value, config):
 
 # =================================================================
 def init_collection(route_config):
-    ds_rules_file = route_config.get('domain_specific_rules', None)
+    ds_rules_file = route_config.get('domain_specific_rules', DEFAULT_RULES_FILE)
 
     html_view = init_view(route_config, 'query_html', J2HtmlCapturesView)
 

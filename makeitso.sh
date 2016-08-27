@@ -41,7 +41,7 @@ do
   echo ${filename}
 
   if [[ "$filename" == "wayback" ]]; then
-      chmod a+x "dist/pywb/pywb"
+      chmod a+x "dist/pywb/wayback"
       cp -RT dist/pywb ${distDir}
   else
       chmod a+x "dist/$filename/$filename"

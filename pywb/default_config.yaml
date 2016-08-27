@@ -63,6 +63,4 @@ static_routes:
 
 enable_memento: true
 
-domain_specific_rules: pywb/rules.yaml
-
 framed_replay: inverse
